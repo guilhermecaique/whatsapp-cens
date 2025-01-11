@@ -31,9 +31,26 @@ if (!respostas.length) {
 
 // Controlar o progresso dos contatos
 const progresso = contatos.reduce((acc, contato) => {
-    acc[contato.Numero] = 0; // Começar com a primeira pergunta
+    acc[contato.Numero] = 0;
     return acc;
 }, {});
+
+// Controle de justificativas aguardando resposta
+const aguardandoJustificativa = {};
+
+// Função para salvar no Excel
+function salvarNoExcel(pergunta, resposta, contatoNome) {
+    const novaPlanilhaRespostas = xlsx.utils.aoa_to_sheet(respostas);
+    respostasWorkbook.Sheets['Respostas'] = novaPlanilhaRespostas;
+    xlsx.writeFile(respostasWorkbook, './pesquisa.xlsx');
+
+    console.log(`✅ Resposta salva: [Pergunta: "${pergunta}"] - Resposta: "${resposta}" - Contato: ${contatoNome}`);
+}
+
+// Função para encontrar a primeira linha livre no Excel
+function encontrarLinhaLivre(pergunta) {
+    return respostas.findIndex(linha => linha[0] === pergunta) || respostas.length;
+}
 
 // Função para conectar ao WhatsApp
 async function conectarWhatsApp() {
@@ -86,19 +103,20 @@ async function enviarPergunta(socket, numeroContato) {
 
     if (indicePerguntaAtual >= perguntas.length) {
         console.log(`✅ Todas as perguntas respondidas por ${numeroContato}`);
+        await socket.sendMessage(`${numeroContato}@s.whatsapp.net`, { text: 'Você respondeu todas as perguntas. Obrigado!' });
         return;
     }
 
     const pergunta = perguntas[indicePerguntaAtual];
-    let mensagem = `${pergunta.Pergunta}\n\n`;
+    let mensagem = `• *${pergunta.Pergunta}*\n\n`;
 
-    for (let i = 1; i <= 5; i++) {
+    for (let i = 1; i <= 4; i++) {
         if (pergunta[`Resposta${i}`]) {
-            mensagem += `${i} - ${pergunta[`Resposta${i}`]}\n`;
+            mensagem += `*${i}* - ${pergunta[`Resposta${i}`]}\n\n`;
         }
     }
 
-    mensagem += '\nResponda com 1, 2, 3, 4 ou 5';
+    mensagem += `*5* - Outros (justificar) \n\nResponda com *1, 2, 3, 4 ou 5*.`; 
 
     const numeroComSufixo = `${numeroContato}@s.whatsapp.net`;
 
@@ -120,9 +138,9 @@ async function tratarResposta(socket, mensagem) {
         return;
     }
 
-    // Se a mensagem for mídia, ignorar e informar o usuário
+    // Bloquear envio de mídia
     if (mensagem.message.audioMessage || mensagem.message.imageMessage || mensagem.message.videoMessage || mensagem.message.stickerMessage) {
-        console.log(`❌ Mensagem de mídia recebida de ${contato.Nome}. Ignorando...`);
+        console.log(`❌ Mídia recebida de ${contato.Nome}. Ignorando...`);
         await socket.sendMessage(mensagem.key.remoteJid, { text: 'Por favor, envie apenas uma resposta numérica entre 1 e 5.' });
         return;
     }
@@ -130,52 +148,55 @@ async function tratarResposta(socket, mensagem) {
     const resposta = mensagem.message.conversation?.trim();
     if (!resposta) return;
 
-    const indicePerguntaAtual = progresso[numeroContato];
-    if (indicePerguntaAtual >= perguntas.length) {
-        console.log(`❌ ${contato.Nome} já respondeu todas as perguntas.`);
-        await socket.sendMessage(mensagem.key.remoteJid, { text: 'Você já respondeu todas as perguntas. Obrigado!' });
+    // Verificação de número inteiro válido (1 a 5)
+    if (!aguardandoJustificativa[numeroContato] && (!/^\d+$/.test(resposta) || parseInt(resposta, 10) > 5 || parseInt(resposta, 10) < 1)) {
+        console.log(`❌ Resposta inválida de ${contato.Nome}: ${resposta}`);
+        await socket.sendMessage(mensagem.key.remoteJid, { text: 'Por favor, responda com um número entre 1 e 5.' });
         return;
     }
 
-    const pergunta = perguntas[indicePerguntaAtual];
+    // Lógica para continuar com o fluxo de perguntas
+    const indicePerguntaAtual = progresso[numeroContato];
+    const perguntaAtual = perguntas[indicePerguntaAtual];
+
+    const linhaLivre = encontrarLinhaLivre(perguntaAtual.Pergunta);
+    const colunaContato = respostas[0].indexOf(contato.Nome);
+
+    if (aguardandoJustificativa[numeroContato]) {
+        const justificativa = resposta;
+
+        if (linhaLivre !== -1 && colunaContato !== -1) {
+            respostas[linhaLivre][colunaContato] = `(Outros) ${justificativa}`;
+            salvarNoExcel(perguntaAtual.Pergunta, justificativa, contato.Nome);
+        }
+
+        delete aguardandoJustificativa[numeroContato];
+
+        console.log(`✅ Justificativa recebida de ${contato.Nome}: "${justificativa}"`);
+
+        progresso[numeroContato]++;
+        enviarPergunta(socket, numeroContato);
+        return;
+    }
+
     const indiceResposta = parseInt(resposta, 10);
 
-    if (!isNaN(indiceResposta) && indiceResposta >= 1 && indiceResposta <= 5) {
-        const respostaSelecionada = pergunta[`Resposta${indiceResposta}`];
+    if (indiceResposta >= 1 && indiceResposta <= 4) {
+        const respostaSelecionada = perguntaAtual[`Resposta${indiceResposta}`];
 
-        if (respostaSelecionada) {
-            console.log(`✅ Resposta válida recebida de ${contato.Nome}: ${respostaSelecionada}`);
-
-            const linhaPergunta = respostas.findIndex(linha => linha[0] === pergunta.Pergunta);
-            const colunaContato = respostas[0].indexOf(contato.Nome);
-
-            if (linhaPergunta === -1) {
-                const novaLinha = Array(respostas[0].length).fill('');
-                novaLinha[0] = pergunta.Pergunta;
-                novaLinha[colunaContato] = respostaSelecionada;
-                respostas.push(novaLinha);
-            } else {
-                respostas[linhaPergunta][colunaContato] = respostaSelecionada;
-            }
-
-            const novaPlanilhaRespostas = xlsx.utils.aoa_to_sheet(respostas);
-            respostasWorkbook.Sheets['Respostas'] = novaPlanilhaRespostas;
-            xlsx.writeFile(respostasWorkbook, './pesquisa.xlsx');
-
-            await socket.sendMessage(mensagem.key.remoteJid, { text: `Obrigado por sua resposta: ${respostaSelecionada}` });
-
-            progresso[numeroContato]++;
-            enviarPergunta(socket, numeroContato);
-        } else {
-            console.log(`❌ Índice de resposta inválido: ${indiceResposta}`);
+        if (linhaLivre !== -1 && colunaContato !== -1) {
+            respostas[linhaLivre][colunaContato] = respostaSelecionada;
+            salvarNoExcel(perguntaAtual.Pergunta, respostaSelecionada, contato.Nome);
         }
-    } else {
-        console.log(`❌ Resposta inválida de ${contato.Nome}: ${resposta}`);
-        await socket.sendMessage(mensagem.key.remoteJid, { text: 'Por favor, responda com um número entre 1 e 5.' });
+
+        progresso[numeroContato]++;
+        enviarPergunta(socket, numeroContato);
+    } else if (indiceResposta === 5) {
+        aguardandoJustificativa[numeroContato] = true;
+        await socket.sendMessage(mensagem.key.remoteJid, { text: 'Por favor, justifique sua resposta:' });
     }
 }
 
-// Iniciar o bot
 conectarWhatsApp().catch(erro => {
     console.error('Erro ao conectar ao WhatsApp:', erro);
 });
